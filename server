@@ -1,1 +1,598 @@
 
+#include <sstream>
+#include <random>
+#include "OuterFactoryImp.h"
+#include "LogComm.h"
+#include "PushServer.h"
+#include "UserStateProcessor.h"
+#include "util/tc_hash_fun.h"
+#include "Push.h"
+#include "HallProto.h"
+
+//
+using namespace std;
+using namespace wbl;
+using namespace JFGame;
+using namespace hall;
+
+/**
+ *
+*/
+OuterFactoryImp::OuterFactoryImp() : _pFileConf(NULL)
+{
+    createAllObject();
+}
+
+/**
+ *
+*/
+OuterFactoryImp::~OuterFactoryImp()
+{
+    deleteAllObject();
+}
+
+/**
+ *
+*/
+void OuterFactoryImp::deleteAllObject()
+{
+    if (_pFileConf)
+    {
+        delete _pFileConf;
+        _pFileConf = NULL;
+    }
+}
+
+//
+void OuterFactoryImp::createAllObject()
+{
+    try
+    {
+        deleteAllObject();
+
+        //本地配置文件
+        _pFileConf = new tars::TC_Config();
+        if (!_pFileConf)
+        {
+            ROLLLOG_ERROR << "create config parser fail, ptr null." << endl;
+            terminate();
+        }
+
+        //tars代理Factory,访问其他tars接口时使用
+        _pProxyFactory = new OuterProxyFactory();
+        if (!_pProxyFactory)
+        {
+            ROLLLOG_ERROR << "create outer proxy factory fail, ptr null." << endl;
+            terminate();
+        }
+
+        LOG_DEBUG << "init proxy factory succ." << endl;
+
+        //读取所有配置
+        load();
+    }
+    catch (TC_Exception &ex)
+    {
+        LOG->error() << ex.what() << endl;
+    }
+    catch (exception &e)
+    {
+        LOG->error() << e.what() << endl;
+    }
+    catch (...)
+    {
+        LOG->error() << "unknown exception." << endl;
+    }
+}
+
+//读取所有配置
+void OuterFactoryImp::load()
+{
+    __TRY__
+
+    //拉取远程配置
+    g_app.addConfig(ServerConfig::ServerName + ".conf");
+
+    wbl::WriteLocker lock(m_rwlock);
+
+    _pFileConf->parseFile(ServerConfig::BasePath + ServerConfig::ServerName + ".conf");
+    LOG_DEBUG << "init config file succ : " << ServerConfig::BasePath + ServerConfig::ServerName + ".conf" << endl;
+
+    //加载代理配置
+    readPrxConfig();
+    printPrxConfig();
+
+    //加载在线人数配置
+    readOnlineNumber();
+    //打印在线人数配置
+    printOnlineNumber();
+
+    //加载在线人数时间间隔
+    readOnlineInterval();
+    //打印在线人数时间间隔
+    printOnlineInterval();
+
+    //加载通用配置
+    readGeneralConfigResp();
+    printGeneralConfigResp();
+
+    //加载机器配置
+    readRobotListResp();
+    printRobotListResp();
+
+    mapRoomServerFromRemote.clear();
+    if(getConfigServantPrx()->listAllRoomAddress(mapRoomServerFromRemote) != 0)
+    {
+        LOG_ERROR << "load room conf err..."<< endl;
+    }
+    LOG_DEBUG << "mapRoomServerFromRemote size: "<< mapRoomServerFromRemote.size() << endl;
+
+    __CATCH__
+}
+
+//代理配置
+void OuterFactoryImp::readPrxConfig()
+{
+    _ConfigServantObj = (*_pFileConf).get("/Main/Interface/ConfigServer<ProxyObj>", "");
+    _DBAgentServantObj = (*_pFileConf).get("/Main/Interface/DBAgentServer<ProxyObj>", "");
+    _sHallServantObj = (*_pFileConf).get("/Main/Interface/HallServer<ProxyObj>", "");
+    _sRouterPushObj = (*_pFileConf).get("/Main/Interface/RouterPushObj<ProxyObj>", "");
+    _sLoginServantObj = (*_pFileConf).get("/Main/Interface/LoginServer<ProxyObj>", "");
+}
+
+//打印代理配置
+void OuterFactoryImp::printPrxConfig()
+{
+    FDLOG_CONFIG_INFO << "_ConfigServantObj ProxyObj: "  << _ConfigServantObj << endl;
+    FDLOG_CONFIG_INFO << "_DBAgentServantObj ProxyObj: " << _DBAgentServantObj << endl;
+    FDLOG_CONFIG_INFO << "_sHallServantObj ProxyObj: " << _sHallServantObj << endl;
+    FDLOG_CONFIG_INFO << "_sRouterPushObj ProxyObj: " << _sRouterPushObj << endl;
+    FDLOG_CONFIG_INFO << "_sLoginServantObj ProxyObj: " << _sLoginServantObj << endl;
+}
+
+//加载在线人数配置
+void OuterFactoryImp::readOnlineNumber()
+{
+    string onlinestr = (*_pFileConf).get("/Main<OnlineNumber>", "10|20");
+    splitInt(onlinestr, m_onlineNumberRandom);
+}
+
+//打印在线人数配置
+void OuterFactoryImp::printOnlineNumber()
+{
+    FUNC_ENTRY("");
+
+    ostringstream os;
+    os << "online number, ";
+    for (auto it = m_onlineNumberRandom.begin(); it != m_onlineNumberRandom.end(); ++it)
+    {
+        os << *it << " ";
+    }
+
+    FDLOG_CONFIG_INFO << os.str() << endl;
+
+    FUNC_EXIT("", 0);
+}
+
+//设置在线人数
+void OuterFactoryImp::setOnline()
+{
+    if (m_onlineNumberRandom.size() != 2)
+        return;
+
+    online = nnrand(m_onlineNumberRandom[1], m_onlineNumberRandom[0]);
+}
+
+//获取在线人数
+int OuterFactoryImp::getOnline()
+{
+    return online;
+}
+
+//取在线人数时间间隔
+int OuterFactoryImp::getOnlineInterval()
+{
+    return updateOnlineInterval;
+}
+
+//清除在线玩家状态
+int OuterFactoryImp::cleanOnlineStatus(long user_id/* = -1*/)
+{
+    int iRet = 0;
+    __TRY__
+
+    if (user_id == -1)
+    {
+        userstate::OnlinePlayerListResp onlinePlayerListResp;
+        iRet = UserStateSingleton::getInstance()->CountStatistics(onlinePlayerListResp, false);
+        if (iRet < 0)
+        {
+            LOG_ERROR << "CountStatistics failed, iRet : " << iRet << ", user_id : " << user_id << endl;
+        }
+        else if (iRet == 0)
+        {
+            LOG_DEBUG << "CountStatistics failed, online num : " << iRet << " no need clean, user_id : " << user_id << endl;
+        }
+        else
+        {
+            for (auto ituid = onlinePlayerListResp.uidList.begin(); ituid != onlinePlayerListResp.uidList.end(); ++ituid)
+            {
+                if (*ituid < 0)
+                {
+                    LOG_ERROR << "CountStatistics user_id : " << *ituid << " error, clean failed!" << endl;
+                    continue;
+                }
+
+                //玩家游戏在线状态
+                // iRet = UserStateSingleton::getInstance()->deleteGameInfo(*ituid);
+                // if (iRet != 0)
+                // {
+                //     LOG_ERROR << "deleteGameInfo failed, iRet : " << iRet << ", user_id : " << *ituid << endl;
+                // }
+                iRet = UserStateSingleton::getInstance()->resetGameInfo(*ituid);
+                if (iRet != 0)
+                {
+                    LOG_ERROR << "resetGameInfo failed, iRet : " << iRet << ", user_id : " << *ituid << endl;
+                }
+
+                //玩家在线统计
+                iRet = UserStateSingleton::getInstance()->rmStatistics(*ituid);
+                if (iRet != 0)
+                {
+                    LOG_ERROR << "rmStatistics failed, iRet : " << iRet << ", user_id : " << *ituid << endl;
+                }
+
+                //玩家在线状态
+                iRet = UserStateSingleton::getInstance()->deleteUserStateOnline(*ituid);
+                if (iRet != 0)
+                {
+                    LOG_ERROR << "deleteUserStateOnline failed, iRet : " << iRet << ", user_id : " << *ituid << endl;
+                }
+
+                LOG_DEBUG << "clean online status success, ituid : " << *ituid << endl;
+            }
+        }
+    }
+    else
+    {
+        if (user_id < 0)
+        {
+            LOG_ERROR << "param error, user_id : " << user_id << endl;
+            return -1;
+        }
+
+        //玩家游戏在线状态
+        // iRet = UserStateSingleton::getInstance()->deleteGameInfo(user_id);
+        // if (iRet != 0)
+        // {
+        //     LOG_ERROR << "deleteGameInfo failed, iRet : " << iRet << ", user_id : " << user_id << endl;
+        // }
+        iRet = UserStateSingleton::getInstance()->resetGameInfo(user_id);
+        if (iRet != 0)
+        {
+            LOG_ERROR << "resetGameInfo failed, iRet : " << iRet << ", user_id : " << user_id << endl;
+        }
+
+        //玩家在线统计
+        iRet = UserStateSingleton::getInstance()->rmStatistics(user_id);
+        if (iRet != 0)
+        {
+            LOG_ERROR << "rmStatistics failed, iRet : " << iRet << ", user_id : " << user_id << endl;
+        }
+
+        //玩家在线状态
+        iRet = UserStateSingleton::getInstance()->deleteUserStateOnline(user_id);
+        if (iRet != 0)
+        {
+            LOG_ERROR << "deleteUserStateOnline failed, iRet : " << iRet << ", user_id : " << user_id << endl;
+        }
+
+        LOG_DEBUG << "clean online status success, user_id : " << user_id << endl;
+    }
+
+    __CATCH__
+    return iRet;
+}
+
+//随机范围数
+int OuterFactoryImp::nnrand(int max, int min)
+{
+    std::random_device rd;
+    srand(rd());
+    return min + rand() % (max - min + 1);
+}
+
+//加载在线人数时间间隔
+void OuterFactoryImp::readOnlineInterval()
+{
+    updateOnlineInterval = S2I((*_pFileConf).get("/Main<UpdateOnlineInterval>", "20"));
+}
+
+//打印在线人数时间间隔
+void OuterFactoryImp::printOnlineInterval()
+{
+    FDLOG_CONFIG_INFO << "UpdateOnlineInterval: " << updateOnlineInterval << endl;
+}
+
+//游戏配置服务代理
+const ConfigServantPrx OuterFactoryImp::getConfigServantPrx()
+{
+    if (!_ConfigServerPrx)
+    {
+        _ConfigServerPrx = Application::getCommunicator()->stringToProxy<ConfigServantPrx>(_ConfigServantObj);
+        ROLLLOG_DEBUG << "Init _ConfigServantObj succ, _ConfigServantObj : " << _ConfigServantObj << endl;
+    }
+
+    return _ConfigServerPrx;
+}
+
+//数据库代理服务代理
+const DBAgentServantPrx OuterFactoryImp::getDBAgentServantPrx(const long uid)
+{
+    if (!_DBAgentServerPrx)
+    {
+        _DBAgentServerPrx = Application::getCommunicator()->stringToProxy<dbagent::DBAgentServantPrx>(_DBAgentServantObj);
+        ROLLLOG_DEBUG << "Init _DBAgentServantObj succ, _DBAgentServantObj : " << _DBAgentServantObj << endl;
+    }
+
+    if (_DBAgentServerPrx)
+    {
+        return _DBAgentServerPrx->tars_hash(uid);
+    }
+
+    return NULL;
+}
+
+//数据库代理服务代理
+const DBAgentServantPrx OuterFactoryImp::getDBAgentServantPrx(const string key)
+{
+    if (!_DBAgentServerPrx)
+    {
+        _DBAgentServerPrx = Application::getCommunicator()->stringToProxy<dbagent::DBAgentServantPrx>(_DBAgentServantObj);
+        ROLLLOG_DEBUG << "Init _DBAgentServantObj succ, _DBAgentServantObj : " << _DBAgentServantObj << endl;
+    }
+
+    if (_DBAgentServerPrx)
+    {
+        return _DBAgentServerPrx->tars_hash(tars::hash<string>()(key));
+    }
+
+    return NULL;
+}
+
+//广场信息服务代理
+const HallServantPrx OuterFactoryImp::getHallServantPrx(const long uid)
+{
+    if (!_hallServerPrx)
+    {
+        _hallServerPrx = Application::getCommunicator()->stringToProxy<HallServantPrx>(_sHallServantObj);
+        LOG_DEBUG << "Init _sHallServantObj succ, _sHallServantObj: " << _sHallServantObj << endl;
+    }
+
+    if (_hallServerPrx)
+    {
+        return _hallServerPrx->tars_hash(uid);
+    }
+
+    return NULL;
+}
+
+//广场信息服务代理
+const HallServantPrx OuterFactoryImp::getHallServantPrx(const string key)
+{
+    if (!_hallServerPrx)
+    {
+        _hallServerPrx = Application::getCommunicator()->stringToProxy<HallServantPrx>(_sHallServantObj);
+        LOG_DEBUG << "Init _sHallServantObj succ, _sHallServantObj: " << _sHallServantObj << endl;
+    }
+
+    if (_hallServerPrx)
+    {
+        return _hallServerPrx->tars_hash(tars::hash<string>()(key));
+    }
+
+    return NULL;
+}
+
+//网关推送服务名称
+const std::string OuterFactoryImp::getRouterPushObj()
+{
+    return _sRouterPushObj;
+}
+
+
+//游戏登录服务代理
+const LoginServantPrx OuterFactoryImp::getLoginServantPrx(const long uid)
+{
+    if (!_loginServerPrx)
+    {
+        _loginServerPrx = Application::getCommunicator()->stringToProxy<LoginServantPrx>(_sLoginServantObj);
+        LOG_DEBUG << "Init _sLoginServantObj succ, _sLoginServantObj: " << _sLoginServantObj << endl;
+    }
+
+    if (_loginServerPrx)
+    {
+        return _loginServerPrx->tars_hash(uid);
+    }
+
+    return NULL;
+}
+
+//游戏登录服务代理
+const LoginServantPrx OuterFactoryImp::getLoginServantPrx(const string key)
+{
+    if (!_loginServerPrx)
+    {
+        _loginServerPrx = Application::getCommunicator()->stringToProxy<LoginServantPrx>(_sLoginServantObj);
+        LOG_DEBUG << "Init _sLoginServantObj succ, _sLoginServantObj: " << _sLoginServantObj << endl;
+    }
+
+    if (_loginServerPrx)
+    {
+        return _loginServerPrx->tars_hash(tars::hash<string>()(key));
+    }
+
+    return NULL;
+}
+
+int OuterFactoryImp::getRoomServerPrx(const string &id, string &prx)
+{
+    auto it = mapRoomServerFromRemote.find(id);
+    if (it == mapRoomServerFromRemote.end())
+        return -1;
+
+    prx = it->second;
+    return 0;
+}
+
+//加载通用配置
+void OuterFactoryImp::readGeneralConfigResp()
+{
+    getConfigServantPrx()->ListGeneralConfig(listGeneralConfigResp);
+}
+
+//打印通用配置
+void OuterFactoryImp::printGeneralConfigResp()
+{
+    ROLLLOG_DEBUG << "listGeneralConfigResp: " << printTars(listGeneralConfigResp) << endl;
+}
+
+//获取通用配置
+const config::ListGeneralConfigResp &OuterFactoryImp::getGeneralConfigResp()
+{
+    return listGeneralConfigResp;
+}
+
+//获取机器人配置
+bool OuterFactoryImp::readRobotListResp()
+{
+    auto prx = getConfigServantPrx();
+    if (!prx)
+    {
+        LOG_ERROR << "readRobotListResp() failed" << endl;
+        return false;
+    }
+
+    wbl::WriteLocker lock(robotLock);
+    prx->ListRobot(robotList);
+    return true;
+}
+
+//打印机器人配置
+void OuterFactoryImp::printRobotListResp()
+{
+    wbl::ReadLocker lock(robotLock);
+    for (auto iter = robotList.begin(); iter != robotList.end(); iter++)
+    {
+        LOG_ERROR << "robot guid: " << *iter << endl;
+    }
+}
+
+//获取机器人列表
+const std::vector<tars::Int64> &OuterFactoryImp::getRobotList()
+{
+    wbl::ReadLocker lock(robotLock);
+    return robotList;
+}
+
+//异步广播所有网关
+void OuterFactoryImp::asyncBroadcastRouterServer(const long uid, const long cid, const string &addr, const int state, const string &data)
+{
+    auto proxyList = Application::getCommunicator()->getEndpoint(_sRouterPushObj);
+    for (auto proxy : proxyList)
+    {
+        auto sProxyObj = _sRouterPushObj + "@" + proxy.toString();
+        auto pRouterPushPrx = Application::getCommunicator()->stringToProxy<JFGame::PushPrx>(sProxyObj);
+        if (!pRouterPushPrx)
+        {
+            ROLLLOG_ERROR << "pRouterPushPrx is null, sProxyObj:" << sProxyObj << endl;
+            continue;
+        }
+
+        ROLLLOG_DEBUG << "------>sRouterPushObj: " << sProxyObj << endl;
+        pRouterPushPrx->tars_hash(uid)->async_doPushUserState(NULL, uid, cid, state, addr, data);
+    }
+}
+
+//异步更新用户状态时间
+void OuterFactoryImp::asyncUserStateNotify(const long uid)
+{
+    auto pLoginServant = getHallServantPrx(uid);
+    if (!pLoginServant)
+    {
+        ROLLLOG_ERROR << "pLoginServant is null, uid:" << uid << endl;
+        return;
+    }
+
+    hall::RouterUserStateReq req;
+    req.uid = uid;
+    req.state = 2;
+    pLoginServant->async_RouterUserState(NULL, req);
+}
+
+//格式化时间
+string OuterFactoryImp::GetTimeFormat()
+{
+    string sFormat("%Y-%m-%d %H:%M:%S");
+    time_t t = TNOW;
+    auto pTm = localtime(&t);
+    if (!pTm)
+        return "";
+
+    char sTimeString[255] = "\0";
+    strftime(sTimeString, sizeof(sTimeString), sFormat.c_str(), pTm);
+    return string(sTimeString);
+}
+
+//获得时间秒数
+int OuterFactoryImp::GetTimeTick(const string &str)
+{
+    if (str.empty())
+        return 0;
+
+    struct tm tm_time;
+     tm_time.tm_isdst=0;
+    string sFormat("%Y-%m-%d %H:%M:%S");
+    strptime(str.c_str(), sFormat.c_str(), &tm_time);
+    return mktime(&tm_time);
+}
+
+//格式化自定义年月日
+int OuterFactoryImp::GetCustomDateFormat(int time)
+{
+    string sFormat("%Y%m%d");
+    time_t t = time_t(time);
+    struct tm *pTm = localtime(&t);
+    if (pTm == NULL)
+    {
+        return 0;
+    }
+
+    char sDateString[10] = "\0";
+    strftime(sDateString, sizeof(sDateString), sFormat.c_str(), pTm);
+    return S2I(sDateString);
+}
+
+//获取当天零点秒数
+int OuterFactoryImp::GetZeroTimeTick(int time)
+{
+    time_t t = time_t(time);
+    //struct tm *pTm = localtime(&t);
+    struct tm pTm;
+    localtime_r(&t, &pTm);
+    pTm.tm_hour = 0;
+    pTm.tm_min  = 0;
+    pTm.tm_sec  = 0;
+    return mktime(&pTm);
+}
+
+//拆分字符串成整形
+int OuterFactoryImp::splitInt(string szSrc, vector<int> &vecInt)
+{
+    split_int(szSrc, "[ \t]*\\|[ \t]*", vecInt);
+    return 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+
